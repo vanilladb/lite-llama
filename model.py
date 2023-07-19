@@ -1,5 +1,7 @@
 import os
+import time
 import math
+import concurrent.futures
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -167,11 +169,24 @@ class Transformer(nn.Module):
     def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=2048):
         super().__init__()
         self.n_layers = n_layers
-        self.layer_cache = [TransformerBlock(dim, multiple_of, n_heads, norm_eps)]
+        self.cache_size = 2
+        self.layer_cache = [TransformerBlock(dim, multiple_of, n_heads, norm_eps) for _ in range(self.cache_size)]
+        self.cache_state = [False for _ in range(self.cache_size)]
         self.norm = RMSNorm(dim, norm_eps)
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         self.output = nn.Linear(dim, vocab_size, bias=False)
         self.freqs_cis = precompute_freqs_cis(dim // n_heads, max_seq_len)
+
+    def prefetcher(self, device=None):
+        while True:
+            for layer in range(self.n_layers):
+                cache = layer % self.cache_size
+                while self.cache_state[cache] is True:
+                    time.sleep(0.001)
+                    continue
+                self.layer_cache[cache].fetch(layer)
+                self.layer_cache[cache].to(device)
+                self.cache_state[cache] = True
 
     def forward(self, tokens, start_pos, device=None):
         _bsz, seqlen = tokens.shape
@@ -183,10 +198,13 @@ class Transformer(nn.Module):
             mask = torch.full((1, 1, seqlen, seqlen), float('-inf'), device=tokens.device)
             mask = torch.triu(mask, diagonal=start_pos+1)
 
-        for i in range(self.n_layers):
-            self.layer_cache[0].fetch(i) # TODO: async execution
-            self.layer_cache[0].to(device)
-            h = self.layer_cache[0](h, start_pos, freqs_cis, mask)
+        for layer in range(self.n_layers):
+            cache = layer % self.cache_size
+            while self.cache_state[cache] is False:
+                time.sleep(0.001)
+                continue
+            h = self.layer_cache[cache](h, start_pos, freqs_cis, mask)
+            self.cache_state[cache] = False
 
         return self.output(self.norm(h)[:, -1, :]) # only compute the last logits
     
@@ -210,11 +228,15 @@ if __name__ == '__main__':
     
     model = Transformer(**args_7B).half().to(device)
     model.load_state_dict(torch.load('serialized/io.pt'))
+
+    executor = concurrent.futures.ThreadPoolExecutor()
+    prefetcher = executor.submit(model.prefetcher, device)
+
     prompt = "Elon Musk is "
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
 
     while True:
-        with torch.inference_mode(), Timing():
+        with torch.inference_mode(), Timing('== '):
             logits = model(torch.tensor(toks).unsqueeze(dim=0).to(device), 0, device)
         tok = sample(logits, 0.7)
         start_pos = len(toks)
