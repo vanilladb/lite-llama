@@ -57,7 +57,7 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim, device='cuda'))
         self.dim = dim
 
     def _norm(self, x):
@@ -68,7 +68,7 @@ class RMSNorm(nn.Module):
         return output * self.weight
     
     def load_weight(self, data, offset, device=None) -> int:
-        self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float16))
+        self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float16, device='cuda'))
         return offset + self.dim
 
 class Attention(nn.Module):
@@ -110,13 +110,13 @@ class Attention(nn.Module):
     
     def load_weight(self, data, offset) -> int:
         n_param = self.dim * self.dim
-        self.wq.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
+        self.wq.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.dim))
         offset += n_param
-        self.wk.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
+        self.wk.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.dim))
         offset += n_param
-        self.wv.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
+        self.wv.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.dim))
         offset += n_param
-        self.wo.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
+        self.wo.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.dim))
         return offset + n_param
     
 class FeedForward(nn.Module):
@@ -136,11 +136,11 @@ class FeedForward(nn.Module):
     
     def load_weight(self, data, offset) -> int:
         n_param = self.dim * self.hidden_dim
-        self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.hidden_dim, self.dim))
+        self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.hidden_dim, self.dim))
         offset += n_param
-        self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.hidden_dim))
+        self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.hidden_dim))
         offset += n_param
-        self.w3.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.hidden_dim, self.dim))
+        self.w3.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.hidden_dim, self.dim))
         return offset + n_param
     
 class TransformerBlock(nn.Module):
@@ -177,7 +177,7 @@ class Transformer(nn.Module):
         self.output = nn.Linear(dim, vocab_size, bias=False)
         self.freqs_cis = precompute_freqs_cis(dim // n_heads, max_seq_len)
 
-    def prefetcher(self, device=None):
+    def prefetcher(self):
         while True:
             for layer in range(self.n_layers):
                 cache = layer % self.cache_size
@@ -185,7 +185,6 @@ class Transformer(nn.Module):
                     time.sleep(0.001)
                     continue
                 self.layer_cache[cache].fetch(layer)
-                self.layer_cache[cache].to(device)
                 self.cache_state[cache] = True
 
     def forward(self, tokens, start_pos, device=None):
@@ -230,7 +229,7 @@ if __name__ == '__main__':
     model.load_state_dict(torch.load('serialized/io.pt'))
 
     executor = concurrent.futures.ThreadPoolExecutor()
-    prefetcher = executor.submit(model.prefetcher, device)
+    prefetcher = executor.submit(model.prefetcher)
 
     prompt = "Elon Musk is "
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
