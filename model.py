@@ -42,7 +42,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
-def apply_rotary_emb(xq, xk, freqs_cis):
+def apply_rotary_emb(xq, xk, freqs_cis, device=None):
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
@@ -64,7 +64,7 @@ class RMSNorm(nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
     
-    def load_weight(self, data, offset) -> int:
+    def load_weight(self, data, offset, device=None) -> int:
         self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float32))
         return offset + self.dim
 
@@ -131,7 +131,6 @@ class FeedForward(nn.Module):
     def load_weight(self, data, offset) -> int:
         n_param = self.dim * self.hidden_dim
         self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float32).view(self.hidden_dim, self.dim))
-        assert self.w1.weight.numel() == n_param, "Something wrong"
         offset += n_param
         self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float32).view(self.dim, self.hidden_dim))
         offset += n_param
@@ -170,10 +169,10 @@ class Transformer(nn.Module):
         self.output = nn.Linear(dim, vocab_size, bias=False)
         self.freqs_cis = precompute_freqs_cis(dim // n_heads, max_seq_len)
 
-    def forward(self, tokens, start_pos):
+    def forward(self, tokens, start_pos, device=None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen].to(device)
 
         mask = None
         if seqlen > 1:
@@ -182,6 +181,7 @@ class Transformer(nn.Module):
 
         for i in range(self.n_layers):
             self.layer_cache[0].fetch(i)
+            self.layer_cache[0].to(device)
             h = self.layer_cache[0](h, start_pos, freqs_cis, mask)
 
         return self.output(self.norm(h)[:, -1, :]) # only compute the last logits
@@ -201,18 +201,17 @@ if __name__ == '__main__':
     sp_model = SentencePieceProcessor(model_file=str(TOKENIZER_FILENAME))
     assert sp_model.vocab_size() == VOCAB_SIZE
 
-    # device = 'cuda' if torch.cuda.is_available else 'cpu'
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available else 'cpu'
     print(f'Device: {device}')
     
     model = Transformer(**args_7B).to(device)
     model.load_state_dict(torch.load('serialized/io.pt'))
-    prompt = "Mark Zuckerberg is "
+    prompt = "Elon Musk is "
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
 
     while True:
         with torch.inference_mode():
-            logits = model(torch.tensor(toks).view(1, -1).to(device), 0)
+            logits = model(torch.tensor(toks).unsqueeze(dim=0).to(device), 0, device)
         tok = sample(logits, 0.7)
         start_pos = len(toks)
         toks.append(tok)
