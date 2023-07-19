@@ -3,12 +3,13 @@ import math
 from pathlib import Path
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 torch.manual_seed(1337)
 import torch.nn as nn
 from torch.nn import functional as F
 
-import numpy as np
+from utils import Timing
 
 @dataclass
 class ModelArgs:
@@ -65,7 +66,7 @@ class RMSNorm(nn.Module):
         return output * self.weight
     
     def load_weight(self, data, offset, device=None) -> int:
-        self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float32))
+        self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float16))
         return offset + self.dim
 
 class Attention(nn.Module):
@@ -104,13 +105,13 @@ class Attention(nn.Module):
     
     def load_weight(self, data, offset) -> int:
         n_param = self.dim * self.dim
-        self.wq.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float32).view(self.dim, self.dim))
+        self.wq.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
         offset += n_param
-        self.wk.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float32).view(self.dim, self.dim))
+        self.wk.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
         offset += n_param
-        self.wv.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float32).view(self.dim, self.dim))
+        self.wv.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
         offset += n_param
-        self.wo.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float32).view(self.dim, self.dim))
+        self.wo.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
         return offset + n_param
     
 class FeedForward(nn.Module):
@@ -130,11 +131,11 @@ class FeedForward(nn.Module):
     
     def load_weight(self, data, offset) -> int:
         n_param = self.dim * self.hidden_dim
-        self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float32).view(self.hidden_dim, self.dim))
+        self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.hidden_dim, self.dim))
         offset += n_param
-        self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float32).view(self.dim, self.hidden_dim))
+        self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.hidden_dim))
         offset += n_param
-        self.w3.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float32).view(self.hidden_dim, self.dim))
+        self.w3.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.hidden_dim, self.dim))
         return offset + n_param
     
 class TransformerBlock(nn.Module):
@@ -204,13 +205,13 @@ if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available else 'cpu'
     print(f'Device: {device}')
     
-    model = Transformer(**args_7B).to(device)
+    model = Transformer(**args_7B).half().to(device)
     model.load_state_dict(torch.load('serialized/io.pt'))
     prompt = "Elon Musk is "
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
 
     while True:
-        with torch.inference_mode():
+        with torch.inference_mode(), Timing():
             logits = model(torch.tensor(toks).unsqueeze(dim=0).to(device), 0, device)
         tok = sample(logits, 0.7)
         start_pos = len(toks)
