@@ -83,15 +83,18 @@ class Attention(nn.Module):
         xq, xk, xv = [x.view(bsz, seqlen, self.n_heads, self.head_dim) for x in (xq, xk, xv)]
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if start_pos == 0:
-            keys, values = xk, xv
-        else:
-            assert hasattr(self, 'cache_k'), "no cache"
-            keys, values = torch.cat(self.cache_k, xk, dim=1), torch.cat(self.cache_v, xv, dim=1)
+        # TODO: kv caching is broken
+        # if start_pos == 0:
+        #     keys, values = xk, xv
+        # else:
+        #     assert hasattr(self, 'cache_k'), "no cache"
+        #     keys, values = torch.cat((self.cache_k, xk), dim=1), torch.cat((self.cache_v, xv), dim=1)
         
-        self.cache_k = keys
-        self.cache_v = values
-        
+        # self.cache_k = keys
+        # self.cache_v = values
+        keys = xk
+        values = xv
+
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
@@ -181,7 +184,7 @@ class Transformer(nn.Module):
             mask = torch.triu(mask, diagonal=start_pos+1)
 
         for i in range(self.n_layers):
-            self.layer_cache[0].fetch(i)
+            self.layer_cache[0].fetch(i) # TODO: async execution
             self.layer_cache[0].to(device)
             h = self.layer_cache[0](h, start_pos, freqs_cis, mask)
 
