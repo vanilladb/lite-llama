@@ -199,7 +199,7 @@ class Transformer(nn.Module):
 
 # **** files and arguments ****
 
-PARAM = '7B'
+PARAM = '13B'
 WEIGHTS_DIR = Path("weights")
 TOKENIZER_FILENAME = WEIGHTS_DIR / "tokenizer.model"
 VOCAB_SIZE = 32000

@@ -27,15 +27,20 @@ TMP_DIR.mkdir(exist_ok=True)
 print(f'Using LLaMA-{PARAM}')
 
 state_dict_keys = None
+
 for filename in WEIGHT_FILES[PARAM]:
     with Timing('Finished loading state dict in '):
         state_dict = torch.load(filename, map_location=device)
 
-    state_dict_keys = state_dict.keys() if state_dict_keys is None else state_dict_keys
-    for state in state_dict.items():
-        disk_tensor_file = TMP_DIR / state[0]
+    state_dict_keys = list(state_dict.keys()) if state_dict_keys is None else state_dict_keys
+    for state in state_dict.items(): # TODO: verify state[1] datatype, it may not be torch.tensor
+        disk_tensor_file = TMP_DIR / state[0] 
         if disk_tensor_file.exists():
-            disk_tensor = list(torch.load(disk_tensor_file, map_location=device))
+            if len(state[1]) == 1:
+                continue
+            if len(state[1].shape) == 1:
+                continue
+            disk_tensor = torch.load(disk_tensor_file, map_location=device)
             if state[0].startswith('tok_embeddings') \
                 or state[0].endswith('.attention.wo.weight') \
                 or state[0].endswith('.feed_forward.w2.weight'):
@@ -43,7 +48,10 @@ for filename in WEIGHT_FILES[PARAM]:
             else:
                 axis = 0
             disk_tensor[1] = torch.cat((disk_tensor[1], state[1]), dim=axis)
-        torch.save(state, disk_tensor_file)
+            torch.save(disk_tensor, disk_tensor_file)
+            del disk_tensor
+        else:
+            torch.save(list(state), disk_tensor_file)
     del state_dict
 
 output_dir = Path(f'serialized/{PARAM}/')
