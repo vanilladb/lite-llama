@@ -13,17 +13,6 @@ from torch.nn import functional as F
 
 from utils import Timing
 
-@dataclass
-class ModelArgs:
-    dim: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    vocab_size: int = -1  # defined later by tokenizer
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    norm_eps: float = 1e-5
-    max_batch_size: int = 32
-    max_seq_len: int = 2048
-
 def sample(logits, temperature):
     if temperature < 1e-6:
         return int(logits.item().argmax())
@@ -144,20 +133,20 @@ class FeedForward(nn.Module):
         return offset + n_param
     
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, multiple_of, n_heads, norm_eps):
+    def __init__(self, dim, multiple_of, n_heads, norm_eps, param):
         super().__init__()
         self.attention = Attention(dim, n_heads)
         self.feed_forward = FeedForward(dim, 4*dim, multiple_of)
         self.attention_norm = RMSNorm(dim, norm_eps)
         self.ffn_norm = RMSNorm(dim, norm_eps)
+        self.serialized_dir = f'serialized/{param}'
 
     def forward(self, x, start_pos, freqs_cis, mask):
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         return h + self.feed_forward(self.ffn_norm(h))
     
     def fetch(self, layer: int):
-        serialized_dir = 'serialized'
-        data = np.memmap(os.path.join(serialized_dir, f'layer{layer}.bin'), dtype=np.float16, mode='r')
+        data = np.memmap(os.path.join(self.serialized_dir, f'layer{layer}.bin'), dtype=np.float16, mode='r')
 
         offset = 0
         offset = self.attention.load_weight(data, offset)
@@ -166,11 +155,11 @@ class TransformerBlock(nn.Module):
         self.ffn_norm.load_weight(data, offset)
 
 class Transformer(nn.Module):
-    def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=2048):
+    def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=2048, param='7B'):
         super().__init__()
         self.n_layers = n_layers
         self.cache_size = 2
-        self.layer_cache = [TransformerBlock(dim, multiple_of, n_heads, norm_eps) for _ in range(self.cache_size)]
+        self.layer_cache = [TransformerBlock(dim, multiple_of, n_heads, norm_eps, param) for _ in range(self.cache_size)]
         self.cache_state = [False for _ in range(self.cache_size)]
         self.norm = RMSNorm(dim, norm_eps)
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
@@ -210,12 +199,22 @@ class Transformer(nn.Module):
 
 # **** files and arguments ****
 
+PARAM = '7B'
 WEIGHTS_DIR = Path("weights")
 TOKENIZER_FILENAME = WEIGHTS_DIR / "tokenizer.model"
 VOCAB_SIZE = 32000
 
-args_7B = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
-args_13B = {"dim": 5120, "multiple_of": 256, "n_heads": 40, "n_layers": 40, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
+args_7B = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE, "param": "7B"}
+args_13B = {"dim": 5120, "multiple_of": 256, "n_heads": 40, "n_layers": 40, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE, "param": "13B"}
+args_30B = {"dim": 6656, "multiple_of": 256, "n_heads": 52, "n_layers": 60, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE, "param": "30B"}
+args_65B = {"dim": 8192, "multiple_of": 256, "n_heads": 64, "n_layers": 80, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE, "param": "65B"}
+
+args = {
+    '7B': args_7B,
+    '13B': args_13B,
+    '30B': args_30B,
+    '65B': args_65B
+}
 
 if __name__ == '__main__':
     from sentencepiece import SentencePieceProcessor
@@ -225,8 +224,8 @@ if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available else 'cpu'
     print(f'Device: {device}')
     
-    model = Transformer(**args_7B).half().to(device)
-    model.load_state_dict(torch.load('serialized/io.pt'))
+    model = Transformer(**args[PARAM]).half().to(device)
+    model.load_state_dict(torch.load(f'serialized/{PARAM}/io.pt'))
 
     executor = concurrent.futures.ThreadPoolExecutor()
     prefetcher = executor.submit(model.prefetcher)
