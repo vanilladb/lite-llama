@@ -71,15 +71,6 @@ class Attention(nn.Module):
         xq, xk, xv = [x.view(bsz, seqlen, self.n_heads, self.head_dim) for x in (xq, xk, xv)]
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # TODO: kv caching is broken
-        # if start_pos == 0:
-        #     keys, values = xk, xv
-        # else:
-        #     assert hasattr(self, 'cache_k'), "no cache"
-        #     keys, values = torch.cat((self.cache_k, xk), dim=1), torch.cat((self.cache_v, xv), dim=1)
-        
-        # self.cache_k = keys
-        # self.cache_v = values
         keys = xk
         values = xv
 
@@ -212,11 +203,12 @@ if __name__ == '__main__':
     model = Transformer(**args[PARAM]).half().to(device)
     model.load_state_dict(torch.load(f'serialized/{PARAM}/io.pt'))
 
-    prompt = input('Enter prompt here: ')
+    # prompt = input('Enter prompt here: ')
+    prompt = 'Elon Musk is '
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
 
     while True:
-        with torch.inference_mode():
+        with torch.inference_mode(), Timing():
             logits = model(torch.tensor(toks).unsqueeze(dim=0).to(device), 0, device)
         tok = sample(logits, 0.7)
         start_pos = len(toks)
