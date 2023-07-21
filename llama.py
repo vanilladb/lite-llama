@@ -1,11 +1,10 @@
 import os
 import math
 from pathlib import Path
-from dataclasses import dataclass
 
 import numpy as np
 import torch
-torch.manual_seed(1337)
+# torch.manual_seed(1337)
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -175,7 +174,9 @@ class Transformer(nn.Module):
 
         for layer in range(self.n_layers):
             cache = layer % self.cache_size
+            # with Timing('IO: '):
             self.layer_cache[0].fetch(layer, device) # TODO: async execution
+            # with Timing('Compute: '):
             h = self.layer_cache[cache](h, start_pos, freqs_cis, mask)
 
         return self.output(self.norm(h)[:, -1, :]) # only compute the last logits
@@ -183,7 +184,7 @@ class Transformer(nn.Module):
 
 # **** files and arguments ****
 
-PARAM = '13B'
+PARAM = '7B'
 WEIGHTS_DIR = Path("weights")
 TOKENIZER_FILENAME = WEIGHTS_DIR / "tokenizer.model"
 VOCAB_SIZE = 32000
@@ -211,11 +212,11 @@ if __name__ == '__main__':
     model = Transformer(**args[PARAM]).half().to(device)
     model.load_state_dict(torch.load(f'serialized/{PARAM}/io.pt'))
 
-    prompt = "Elon Musk is "
+    prompt = input('Enter prompt here: ')
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
 
     while True:
-        with torch.inference_mode(), Timing('== '):
+        with torch.inference_mode():
             logits = model(torch.tensor(toks).unsqueeze(dim=0).to(device), 0, device)
         tok = sample(logits, 0.7)
         start_pos = len(toks)
