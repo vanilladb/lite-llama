@@ -11,17 +11,6 @@ from torch.nn import functional as F
 
 from utils import Timing
 
-@dataclass
-class ModelArgs:
-    dim: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    vocab_size: int = -1  # defined later by tokenizer
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    norm_eps: float = 1e-5
-    max_batch_size: int = 32
-    max_seq_len: int = 2048
-
 def sample(logits, temperature):
     if temperature < 1e-6:
         return int(logits.item().argmax())
@@ -55,7 +44,7 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim, device='cuda'))
         self.dim = dim
 
     def _norm(self, x):
@@ -66,7 +55,7 @@ class RMSNorm(nn.Module):
         return output * self.weight
     
     def load_weight(self, data, offset, device=None) -> int:
-        self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float16))
+        self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float16, device=device))
         return offset + self.dim
 
 class Attention(nn.Module):
@@ -106,15 +95,15 @@ class Attention(nn.Module):
 
         return self.wo(output)
     
-    def load_weight(self, data, offset) -> int:
+    def load_weight(self, data, offset, device=None) -> int:
         n_param = self.dim * self.dim
-        self.wq.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
+        self.wq.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
         offset += n_param
-        self.wk.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
+        self.wk.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
         offset += n_param
-        self.wv.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
+        self.wv.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
         offset += n_param
-        self.wo.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.dim))
+        self.wo.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
         return offset + n_param
     
 class FeedForward(nn.Module):
@@ -132,42 +121,43 @@ class FeedForward(nn.Module):
     def __call__(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
     
-    def load_weight(self, data, offset) -> int:
+    def load_weight(self, data, offset, device=None) -> int:
         n_param = self.dim * self.hidden_dim
-        self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.hidden_dim, self.dim))
+        self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim))
         offset += n_param
-        self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.dim, self.hidden_dim))
+        self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.hidden_dim))
         offset += n_param
-        self.w3.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16).view(self.hidden_dim, self.dim))
+        self.w3.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim))
         return offset + n_param
     
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, multiple_of, n_heads, norm_eps):
+    def __init__(self, dim, multiple_of, n_heads, norm_eps, param):
         super().__init__()
         self.attention = Attention(dim, n_heads)
         self.feed_forward = FeedForward(dim, 4*dim, multiple_of)
         self.attention_norm = RMSNorm(dim, norm_eps)
         self.ffn_norm = RMSNorm(dim, norm_eps)
+        self.serialized_dir = f'serialized/{param}'
 
     def forward(self, x, start_pos, freqs_cis, mask):
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         return h + self.feed_forward(self.ffn_norm(h))
     
-    def fetch(self, layer: int):
-        serialized_dir = 'serialized'
-        data = np.memmap(os.path.join(serialized_dir, f'layer{layer}.bin'), dtype=np.float16, mode='r')
+    def fetch(self, layer: int, device=None):
+        data = np.memmap(os.path.join(self.serialized_dir, f'layer{layer}.bin'), dtype=np.float16, mode='r')
 
         offset = 0
-        offset = self.attention.load_weight(data, offset)
-        offset = self.feed_forward.load_weight(data, offset)
-        offset = self.attention_norm.load_weight(data, offset)
-        self.ffn_norm.load_weight(data, offset)
+        offset = self.attention.load_weight(data, offset, device)
+        offset = self.feed_forward.load_weight(data, offset, device)
+        offset = self.attention_norm.load_weight(data, offset, device)
+        self.ffn_norm.load_weight(data, offset, device)
 
 class Transformer(nn.Module):
-    def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=2048):
+    def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=2048, param='7B'):
         super().__init__()
         self.n_layers = n_layers
-        self.layer_cache = [TransformerBlock(dim, multiple_of, n_heads, norm_eps)]
+        self.cache_size = 1
+        self.layer_cache = [TransformerBlock(dim, multiple_of, n_heads, norm_eps, param) for _ in range(self.cache_size)]
         self.norm = RMSNorm(dim, norm_eps)
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -183,22 +173,32 @@ class Transformer(nn.Module):
             mask = torch.full((1, 1, seqlen, seqlen), float('-inf'), device=tokens.device)
             mask = torch.triu(mask, diagonal=start_pos+1)
 
-        for i in range(self.n_layers):
-            self.layer_cache[0].fetch(i) # TODO: async execution
-            self.layer_cache[0].to(device)
-            h = self.layer_cache[0](h, start_pos, freqs_cis, mask)
+        for layer in range(self.n_layers):
+            cache = layer % self.cache_size
+            self.layer_cache[0].fetch(layer, device) # TODO: async execution
+            h = self.layer_cache[cache](h, start_pos, freqs_cis, mask)
 
         return self.output(self.norm(h)[:, -1, :]) # only compute the last logits
     
 
 # **** files and arguments ****
 
+PARAM = '13B'
 WEIGHTS_DIR = Path("weights")
 TOKENIZER_FILENAME = WEIGHTS_DIR / "tokenizer.model"
 VOCAB_SIZE = 32000
 
-args_7B = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
-args_13B = {"dim": 5120, "multiple_of": 256, "n_heads": 40, "n_layers": 40, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
+args_7B = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE, "param": "7B"}
+args_13B = {"dim": 5120, "multiple_of": 256, "n_heads": 40, "n_layers": 40, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE, "param": "13B"}
+args_30B = {"dim": 6656, "multiple_of": 256, "n_heads": 52, "n_layers": 60, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE, "param": "30B"}
+args_65B = {"dim": 8192, "multiple_of": 256, "n_heads": 64, "n_layers": 80, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE, "param": "65B"}
+
+args = {
+    '7B': args_7B,
+    '13B': args_13B,
+    '30B': args_30B,
+    '65B': args_65B
+}
 
 if __name__ == '__main__':
     from sentencepiece import SentencePieceProcessor
@@ -208,13 +208,14 @@ if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available else 'cpu'
     print(f'Device: {device}')
     
-    model = Transformer(**args_7B).half().to(device)
-    model.load_state_dict(torch.load('serialized/io.pt'))
+    model = Transformer(**args[PARAM]).half().to(device)
+    model.load_state_dict(torch.load(f'serialized/{PARAM}/io.pt'))
+
     prompt = "Elon Musk is "
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
 
     while True:
-        with torch.inference_mode(), Timing():
+        with torch.inference_mode(), Timing('== '):
             logits = model(torch.tensor(toks).unsqueeze(dim=0).to(device), 0, device)
         tok = sample(logits, 0.7)
         start_pos = len(toks)
