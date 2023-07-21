@@ -57,7 +57,7 @@ class RMSNorm(nn.Module):
         return output * self.weight
     
     def load_weight(self, data, offset, device=None) -> int:
-        self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float16, device='cuda'))
+        self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float16, device=device))
         return offset + self.dim
 
 class Attention(nn.Module):
@@ -97,15 +97,15 @@ class Attention(nn.Module):
 
         return self.wo(output)
     
-    def load_weight(self, data, offset) -> int:
+    def load_weight(self, data, offset, device=None) -> int:
         n_param = self.dim * self.dim
-        self.wq.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.dim))
+        self.wq.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
         offset += n_param
-        self.wk.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.dim))
+        self.wk.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
         offset += n_param
-        self.wv.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.dim))
+        self.wv.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
         offset += n_param
-        self.wo.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.dim))
+        self.wo.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
         return offset + n_param
     
 class FeedForward(nn.Module):
@@ -123,13 +123,13 @@ class FeedForward(nn.Module):
     def __call__(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
     
-    def load_weight(self, data, offset) -> int:
+    def load_weight(self, data, offset, device=None) -> int:
         n_param = self.dim * self.hidden_dim
-        self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.hidden_dim, self.dim))
+        self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim))
         offset += n_param
-        self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.dim, self.hidden_dim))
+        self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.hidden_dim))
         offset += n_param
-        self.w3.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device='cuda').view(self.hidden_dim, self.dim))
+        self.w3.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim))
         return offset + n_param
     
 class TransformerBlock(nn.Module):
@@ -145,14 +145,14 @@ class TransformerBlock(nn.Module):
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         return h + self.feed_forward(self.ffn_norm(h))
     
-    def fetch(self, layer: int):
+    def fetch(self, layer: int, device=None):
         data = np.memmap(os.path.join(self.serialized_dir, f'layer{layer}.bin'), dtype=np.float16, mode='r')
 
         offset = 0
-        offset = self.attention.load_weight(data, offset)
-        offset = self.feed_forward.load_weight(data, offset)
-        offset = self.attention_norm.load_weight(data, offset)
-        self.ffn_norm.load_weight(data, offset)
+        offset = self.attention.load_weight(data, offset, device)
+        offset = self.feed_forward.load_weight(data, offset, device)
+        offset = self.attention_norm.load_weight(data, offset, device)
+        self.ffn_norm.load_weight(data, offset, device)
 
 class Transformer(nn.Module):
     def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=2048, param='7B'):
@@ -166,14 +166,14 @@ class Transformer(nn.Module):
         self.output = nn.Linear(dim, vocab_size, bias=False)
         self.freqs_cis = precompute_freqs_cis(dim // n_heads, max_seq_len)
 
-    def prefetcher(self):
+    def prefetcher(self, device=None):
         while True:
             for layer in range(self.n_layers):
                 cache = layer % self.cache_size
                 while self.cache_state[cache] is True:
                     time.sleep(0.001)
                     continue
-                self.layer_cache[cache].fetch(layer)
+                self.layer_cache[cache].fetch(layer, device)
                 self.cache_state[cache] = True
 
     def forward(self, tokens, start_pos, device=None):
@@ -199,7 +199,7 @@ class Transformer(nn.Module):
 
 # **** files and arguments ****
 
-PARAM = '13B'
+PARAM = '7B'
 WEIGHTS_DIR = Path("weights")
 TOKENIZER_FILENAME = WEIGHTS_DIR / "tokenizer.model"
 VOCAB_SIZE = 32000
@@ -228,7 +228,7 @@ if __name__ == '__main__':
     model.load_state_dict(torch.load(f'serialized/{PARAM}/io.pt'))
 
     executor = concurrent.futures.ThreadPoolExecutor()
-    prefetcher = executor.submit(model.prefetcher)
+    prefetcher = executor.submit(model.prefetcher, device)
 
     prompt = "Elon Musk is "
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
