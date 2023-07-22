@@ -1,5 +1,8 @@
 #include <iostream>
 #include <cmath>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <torch/torch.h>
 #include <sentencepiece_processor.h>
@@ -131,15 +134,24 @@ class FeedForwardImpl : public torch::nn::Module {
 public:
   FeedForwardImpl(int64_t dim, int64_t hidden_dim, int64_t multiple_of)
     : dim(dim) {
+    hidden_dim = 2 * hidden_dim / 3;
     hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) / multiple_of);
+    this->hidden_dim = hidden_dim;
+
     w1 = register_module("w1", torch::nn::Linear(dim, hidden_dim));
     w2 = register_module("w2", torch::nn::Linear(hidden_dim, dim));
     w3 = register_module("w3", torch::nn::Linear(dim, hidden_dim));
   }
 
   torch::Tensor forward(torch::Tensor x) {
+    // auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false);
+    // w1->weight.set_data(torch::randn({hidden_dim, dim}, options));
     return w2(torch::silu(w1(x)) * w3(x));
   }
+
+  // int64_t load_weight(torch::Tensor data, int64_t offset, torch::Device device=torch::kCUDA) {
+    
+  // }
 
 private:
   torch::nn::Linear w1{nullptr}, w2{nullptr}, w3{nullptr};
@@ -164,6 +176,34 @@ public:
     torch::Tensor h = x + attention->forward(attention_norm->forward(x), start_pos, freqs_cis, mask);
     return h + feed_forward->forward(ffn_norm->forward(h));
   }
+
+  void fetch(int layer) {
+    // TODO: How to store float16
+    // char filename[256];
+    // int fd = open("../../serialized/7B/layer0.bin", O_RDONLY);
+    // if (fd == -1) std::cout << "Error opening file" << std::endl;
+
+    // off_t file_size = lseek(fd, 0, SEEK_END);
+    // if (file_size == (off_t)-1) std::cout << "lseed error" << std::endl;
+
+    // void* data = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    // if (data == MAP_FAILED) std::cout << "mmap error" << std::endl;
+    // close(fd);
+
+    // char* data_ptr = static_cast<char*>(data);
+    // // char first_element = data_ptr[0];
+    // // char 
+    // // unsigned short two_bytes;
+    // float first_element;
+    // std::memcpy(&first_element, data_ptr, sizeof(2)); 
+    
+    // std::cout << (first_element >> 8) << std::endl;
+
+    // if (munmap(data, file_size) == -1) std::cout << "munmap error" << std::endl;
+
+    // return;
+  }
+
 private:
   Attention attention;
   FeedForward feed_forward;
@@ -182,12 +222,10 @@ public:
       norm_eps(norm_eps),
       max_batch_size(max_batch_size),
       max_seq_len(max_seq_len) {
-    // for (int i = 0; i < n_layers; ++i) {
-    //   layers.push_back(TransformerBlock(dim, multiple_of, n_heads, norm_eps));
-    // }
     norm = register_module("norm", RMSNorm(dim, norm_eps));
     tok_embeddings = register_module("tok_embeddings", torch::nn::Embedding(vocab_size, dim));
-    layer = register_module("block", TransformerBlock(dim, multiple_of, n_heads, norm_eps));
+    layer_cache.push_back(TransformerBlock(dim, multiple_of, n_heads, norm_eps));
+    layer_cache[0]->to(torch::kCUDA);
     output = register_module("output", torch::nn::Linear(dim, vocab_size));
     freqs_cis = precompute_freqs_cis(dim / n_heads, max_seq_len);
   }
@@ -202,18 +240,17 @@ public:
     torch::Tensor mask = torch::empty({1, 1, seqlen, seqlen}, device).fill_(std::numeric_limits<float>::lowest());
     mask.triu_(start_pos + 1);
 
-    // for (int layer = 0; layer < n_layers; ++layer) {
-    //   h = layers[layer]->forward(h, start_pos, freqs_cis_sliced, mask);
-    // }
-    h = layer->forward(h, start_pos, freqs_cis_sliced, mask);
+    for (int i = 0; i < n_layers; ++i) {
+      layer_cache[0]->fetch(i);
+      h = layer_cache[0]->forward(h, start_pos, freqs_cis_sliced, mask);
+    }
     return output->forward((norm->forward(h)).narrow(1, -1, 1).squeeze(1)); // only compute the last logits
   }
 private:
   int64_t dim, multiple_of, n_heads, n_layers, cache_size, max_batch_size, max_seq_len;
   double norm_eps;
   std::string param;
-  // std::vector<TransformerBlock> layers;
-  TransformerBlock layer{nullptr};
+  std::vector<TransformerBlock> layer_cache;
   RMSNorm norm{nullptr};
   torch::nn::Embedding tok_embeddings{nullptr};
   torch::nn::Linear output{nullptr};
@@ -236,7 +273,8 @@ int main() {
     std::cerr << status.ToString() << std::endl;
   }
 
-  Transformer model(512, 256, 8, 8, 1e-6, VOCAB_SIZE);
+  torch::InferenceMode guard(true);
+  Transformer model(4096, 256, 32, 32, 1e-6, VOCAB_SIZE);
   model->to(device);
   // load state dict
   std::string prompt = "Elon Musk is ";
@@ -245,11 +283,9 @@ int main() {
   processor.Encode(prompt, &ids);
 
   while (true) {
-    torch::InferenceMode guard;
     torch::Tensor logits;
     torch::Tensor toks = torch::from_blob(ids.data(), {static_cast<int64_t>(ids.size())}, torch::kInt32);
     {
-      torch::NoGradGuard no_grad;
       torch::Tensor input_tensor = toks.unsqueeze(0).to(device);
       logits = model(input_tensor, 0, device);
     }
