@@ -14,11 +14,14 @@ int sample(const torch::Tensor& logits, double temperature) {
 }
 
 torch::Tensor precompute_freqs_cis(int dim, int end, float theta = 10000.0) {
-    torch::Tensor freqs = 1.0 / torch::pow(theta, torch::arange(0, dim, 2).slice(/*start=*/0, /*end=*/dim / 2).to(torch::kFloat32) / dim);
-    torch::Tensor t = torch::arange(end, torch::TensorOptions().device(freqs.device())); // type: ignore
-    freqs = torch::outer(t, freqs).to(torch::kFloat32); // type: ignore
-    torch::Tensor freqs_cis = torch::polar(torch::ones_like(freqs), freqs);
-    return freqs_cis;
+  torch::Tensor indices = torch::arange(0, dim, 2);
+  indices.slice(0, dim/2).to(torch::kFloat);
+  torch::Tensor freq_denominator = torch::pow(theta, indices / dim);
+  torch::Tensor freqs = 1.0 / freq_denominator;
+  torch::Tensor t = torch::arange(end, torch::TensorOptions().device(freqs.device())); // type: ignore
+  freqs = torch::outer(t, freqs).to(torch::kFloat32); // type: ignore
+  torch::Tensor freqs_cis = torch::polar(torch::ones_like(freqs), freqs);
+  return freqs_cis;
 }
 
 torch::Tensor reshape_for_broadcast(const torch::Tensor& freqs_cis, const torch::Tensor& x) {
@@ -36,15 +39,15 @@ torch::Tensor reshape_for_broadcast(const torch::Tensor& freqs_cis, const torch:
 
 std::tuple<torch::Tensor, torch::Tensor> apply_rotary_emb(torch::Tensor xq, torch::Tensor xk, torch::Tensor freqs_cis) {
     // Convert xq and xk to complex numbers
-    torch::Tensor xq_ = torch::view_as_complex(xq.to(torch::kFloat32).reshape({-1, xq.size(-1) / 2, 2}));
-    torch::Tensor xk_ = torch::view_as_complex(xk.to(torch::kFloat32).reshape({-1, xk.size(-1) / 2, 2}));
+    torch::Tensor xq_ = torch::view_as_complex(xq.to(torch::kFloat32).reshape({xq.size(0), xq.size(1), xq.size(2), -1, 2}));
+    torch::Tensor xk_ = torch::view_as_complex(xk.to(torch::kFloat32).reshape({xk.size(0), xk.size(1), xk.size(2), -1, 2}));
 
     // Reshape freqs_cis for broadcasting
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_);
 
     // Apply rotary embeddings
-    torch::Tensor xq_out = torch::view_as_real(xq_ * freqs_cis).flatten(1);
-    torch::Tensor xk_out = torch::view_as_real(xk_ * freqs_cis).flatten(1);
+    torch::Tensor xq_out = torch::view_as_real(xq_ * freqs_cis).flatten(3);
+    torch::Tensor xk_out = torch::view_as_real(xk_ * freqs_cis).flatten(3);
 
     // Convert back to the original data type and return
     return std::make_tuple(xq_out.to(xq.scalar_type()), xk_out.to(xk.scalar_type()));
@@ -106,7 +109,7 @@ public:
 
     xq = xq.transpose(1, 2);
     torch::Tensor keys = xk.transpose(1, 2);
-    torch::Tensor values = xq.transpose(1, 2);
+    torch::Tensor values = xv.transpose(1, 2);
 
     torch::Tensor scores = torch::matmul(xq, keys.transpose(2, 3)) / std::sqrt(static_cast<float>(head_dim));
 
@@ -179,11 +182,12 @@ public:
       norm_eps(norm_eps),
       max_batch_size(max_batch_size),
       max_seq_len(max_seq_len) {
-    for (int i = 0; i < n_layers; ++i) {
-      layers.push_back(TransformerBlock(dim, multiple_of, n_heads, norm_eps));
-    }
+    // for (int i = 0; i < n_layers; ++i) {
+    //   layers.push_back(TransformerBlock(dim, multiple_of, n_heads, norm_eps));
+    // }
     norm = register_module("norm", RMSNorm(dim, norm_eps));
     tok_embeddings = register_module("tok_embeddings", torch::nn::Embedding(vocab_size, dim));
+    layer = register_module("block", TransformerBlock(dim, multiple_of, n_heads, norm_eps));
     output = register_module("output", torch::nn::Linear(dim, vocab_size));
     freqs_cis = precompute_freqs_cis(dim / n_heads, max_seq_len);
   }
@@ -198,16 +202,18 @@ public:
     torch::Tensor mask = torch::empty({1, 1, seqlen, seqlen}, device).fill_(std::numeric_limits<float>::lowest());
     mask.triu_(start_pos + 1);
 
-    for (int layer = 0; layer < n_layers; ++layer) {
-      h = layers[layer]->forward(h, start_pos, freqs_cis_sliced, mask);
-    }
-    return output->forward(norm->forward(h).select(-1, seqlen - 1)); // only compute the last logits
+    // for (int layer = 0; layer < n_layers; ++layer) {
+    //   h = layers[layer]->forward(h, start_pos, freqs_cis_sliced, mask);
+    // }
+    h = layer->forward(h, start_pos, freqs_cis_sliced, mask);
+    return output->forward((norm->forward(h)).narrow(1, -1, 1).squeeze(1)); // only compute the last logits
   }
 private:
   int64_t dim, multiple_of, n_heads, n_layers, cache_size, max_batch_size, max_seq_len;
   double norm_eps;
   std::string param;
-  std::vector<TransformerBlock> layers;
+  // std::vector<TransformerBlock> layers;
+  TransformerBlock layer{nullptr};
   RMSNorm norm{nullptr};
   torch::nn::Embedding tok_embeddings{nullptr};
   torch::nn::Linear output{nullptr};
@@ -215,8 +221,8 @@ private:
 };
 TORCH_MODULE(Transformer);
 
-
 int main() {
+  torch::manual_seed(1337);
   const std::string PARAM = "7B";
   const int VOCAB_SIZE = 32000;
   torch::Device device = torch::kCPU;
@@ -230,14 +236,30 @@ int main() {
     std::cerr << status.ToString() << std::endl;
   }
 
-  // Transformer model(512, 256, 8, 8, 1e-6, VOCAB_SIZE);
-  // model->to(device);
+  Transformer model(512, 256, 8, 8, 1e-6, VOCAB_SIZE);
+  model->to(device);
   // load state dict
   std::string prompt = "Elon Musk is ";
 
   std::vector<int> ids;
   processor.Encode(prompt, &ids);
-  for (const int id : ids) {
-    std::cout << id << std::endl;
+
+  while (true) {
+    torch::InferenceMode guard;
+    torch::Tensor logits;
+    torch::Tensor toks = torch::from_blob(ids.data(), {static_cast<int64_t>(ids.size())}, torch::kInt32);
+    {
+      torch::NoGradGuard no_grad;
+      torch::Tensor input_tensor = toks.unsqueeze(0).to(device);
+      logits = model(input_tensor, 0, device);
+    }
+    int tok = sample(logits, 0.7);
+    ids.push_back(tok);
+
+    std::string text;
+    processor.Decode(ids, &text);
+    std::cout << text << std::endl;
   }
+
+  return 0;
 }
