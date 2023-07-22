@@ -1,5 +1,6 @@
 import os
 import math
+import concurrent.futures
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +44,7 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, device='cuda'))
+        self.weight = nn.Parameter(torch.ones(dim))
         self.dim = dim
 
     def _norm(self, x):
@@ -53,35 +54,38 @@ class RMSNorm(nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
     
-    def load_weight(self, data, offset, device=None) -> int:
-        self.weight = nn.Parameter(torch.tensor(data[offset : offset+self.dim], dtype=torch.float16, device=device))
-        return offset + self.dim
+    def load_weight(self, data, offset, device=None):
+        self.weight.data = torch.tensor(data[offset : offset+self.dim], dtype=torch.float16, device=device)
+        # return offset + self.dim
 
 class Attention(nn.Module):
-    def __init__(self, dim, n_heads):
+    def __init__(self, dim, n_heads, n_layers):
         super().__init__()
         self.wq, self.wk, self.wv, self.wo = [nn.Linear(dim, dim, bias=False) for _ in range(4)]
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
+        self.cache_k = [None for _ in range(n_layers)]
+        self.cache_v = [None for _ in range(n_layers)]
         
-    def forward(self, x, start_pos, freqs_cis, mask):
+    def forward(self, x, start_pos, freqs_cis, mask, layer):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq, xk, xv = [x.view(bsz, seqlen, self.n_heads, self.head_dim) for x in (xq, xk, xv)]
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         # TODO: kv caching is broken
-        # if start_pos == 0:
-        #     keys, values = xk, xv
-        # else:
-        #     assert hasattr(self, 'cache_k'), "no cache"
-        #     keys, values = torch.cat((self.cache_k, xk), dim=1), torch.cat((self.cache_v, xv), dim=1)
+        if start_pos == 0:
+            keys, values = xk, xv
+        else:
+            assert start_pos == self.cache_k[layer].shape[1] and start_pos == self.cache_v[layer].shape[1], f'{start_pos} {self.cache_k[layer].shape}'
+            keys, values = torch.cat((self.cache_k[layer], xk), dim=1), torch.cat((self.cache_v[layer], xv), dim=1)
         
-        # self.cache_k = keys
-        # self.cache_v = values
-        keys = xk
-        values = xv
+        self.cache_k[layer] = keys
+        self.cache_v[layer] = values
+        # print(self.cache_k.shape)
+        # keys = xk
+        # values = xv
 
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
@@ -94,16 +98,16 @@ class Attention(nn.Module):
 
         return self.wo(output)
     
-    def load_weight(self, data, offset, device=None) -> int:
+    def load_weight(self, data, offset, device=None):
         n_param = self.dim * self.dim
-        self.wq.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
+        self.wq.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim)
         offset += n_param
-        self.wk.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
+        self.wk.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim)
         offset += n_param
-        self.wv.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
+        self.wv.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim)
         offset += n_param
-        self.wo.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim))
-        return offset + n_param
+        self.wo.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim)
+        # return offset + n_param
     
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, multiple_of):
@@ -120,43 +124,50 @@ class FeedForward(nn.Module):
     def __call__(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
     
-    def load_weight(self, data, offset, device=None) -> int:
+    def load_weight(self, data, offset, device=None):
         n_param = self.dim * self.hidden_dim
-        self.w1.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim))
+        self.w1.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim)
         offset += n_param
-        self.w2.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.hidden_dim))
+        self.w2.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.hidden_dim)
         offset += n_param
-        self.w3.weight = nn.Parameter(torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim))
-        return offset + n_param
+        self.w3.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim)
+        # return offset + n_param
     
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, multiple_of, n_heads, norm_eps, param):
+    def __init__(self, dim, multiple_of, n_heads, norm_eps, param, n_layers):
         super().__init__()
-        self.attention = Attention(dim, n_heads)
+        self.dim = dim
+        self.attention = Attention(dim, n_heads, n_layers)
         self.feed_forward = FeedForward(dim, 4*dim, multiple_of)
         self.attention_norm = RMSNorm(dim, norm_eps)
         self.ffn_norm = RMSNorm(dim, norm_eps)
         self.serialized_dir = f'serialized/{param}'
 
-    def forward(self, x, start_pos, freqs_cis, mask):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+    def forward(self, x, start_pos, freqs_cis, mask, layer):
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, layer)
         return h + self.feed_forward(self.ffn_norm(h))
     
     def fetch(self, layer: int, device=None):
         data = np.memmap(os.path.join(self.serialized_dir, f'layer{layer}.bin'), dtype=np.float16, mode='r')
-
-        offset = 0
-        offset = self.attention.load_weight(data, offset, device)
-        offset = self.feed_forward.load_weight(data, offset, device)
-        offset = self.attention_norm.load_weight(data, offset, device)
-        self.ffn_norm.load_weight(data, offset, device)
+        offset = [0, 4*self.dim**2, 4*self.dim**2+3*self.dim*self.feed_forward.hidden_dim, 4*self.dim**2+3*self.dim*self.feed_forward.hidden_dim+self.dim]
+        # with Timing('attn + ffwd '):
+        #     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        #         executor.submit(self.attention.load_weight, data, offset[0], device)
+        #         executor.submit(self.feed_forward.load_weight, data, offset[1], device)
+        # with Timing('attention '):
+        self.attention.load_weight(data, offset[0], device)
+        # with Timing('ffwd '):
+        self.feed_forward.load_weight(data, offset[1], device)
+        # with Timing('att norm '):
+        self.attention_norm.load_weight(data, offset[2], device)
+        # with Timing('ffn norm '):
+        self.ffn_norm.load_weight(data, offset[3], device)
 
 class Transformer(nn.Module):
     def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=2048, param='7B'):
         super().__init__()
         self.n_layers = n_layers
-        self.cache_size = 1
-        self.layer_cache = [TransformerBlock(dim, multiple_of, n_heads, norm_eps, param) for _ in range(self.cache_size)]
+        self.layer_cache = [TransformerBlock(dim, multiple_of, n_heads, norm_eps, param, n_layers)]
         self.norm = RMSNorm(dim, norm_eps)
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -173,11 +184,10 @@ class Transformer(nn.Module):
             mask = torch.triu(mask, diagonal=start_pos+1)
 
         for layer in range(self.n_layers):
-            cache = layer % self.cache_size
             # with Timing('IO: '):
             self.layer_cache[0].fetch(layer, device) # TODO: async execution
             # with Timing('Compute: '):
-            h = self.layer_cache[cache](h, start_pos, freqs_cis, mask)
+            h = self.layer_cache[0](h, start_pos, freqs_cis, mask, layer)
 
         return self.output(self.norm(h)[:, -1, :]) # only compute the last logits
     
@@ -212,12 +222,14 @@ if __name__ == '__main__':
     model = Transformer(**args[PARAM]).half().to(device)
     model.load_state_dict(torch.load(f'serialized/{PARAM}/io.pt'))
 
-    prompt = input('Enter prompt here: ')
+    # prompt = input('Enter prompt here: ')
+    prompt = 'Elon Musk is '
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
+    start_pos = 0
 
     while True:
-        with torch.inference_mode():
-            logits = model(torch.tensor(toks).unsqueeze(dim=0).to(device), 0, device)
+        with torch.inference_mode(), Timing('== '):
+            logits = model(torch.tensor(toks[start_pos:]).unsqueeze(dim=0).to(device), start_pos, device)
         tok = sample(logits, 0.7)
         start_pos = len(toks)
         toks.append(tok)
