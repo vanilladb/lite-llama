@@ -1,11 +1,10 @@
 import os
 import math
-import concurrent.futures
 from pathlib import Path
 
 import numpy as np
 import torch
-# torch.manual_seed(1337)
+torch.manual_seed(1337)
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -55,13 +54,14 @@ class RMSNorm(nn.Module):
         return output * self.weight
     
     def load_weight(self, data, offset, device=None):
-        self.weight.data = torch.tensor(data[offset : offset+self.dim], dtype=torch.float16, device=device)
+        self.weight.data = data[offset : offset+self.dim]
         # return offset + self.dim
 
 class Attention(nn.Module):
     def __init__(self, dim, n_heads, n_layers):
         super().__init__()
         self.wq, self.wk, self.wv, self.wo = [nn.Linear(dim, dim, bias=False) for _ in range(4)]
+        self.buf = nn.Parameter(torch.ones(dim*dim//2))
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
@@ -83,9 +83,6 @@ class Attention(nn.Module):
         
         self.cache_k[layer] = keys
         self.cache_v[layer] = values
-        # print(self.cache_k.shape)
-        # keys = xk
-        # values = xv
 
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
@@ -98,16 +95,16 @@ class Attention(nn.Module):
 
         return self.wo(output)
     
-    def load_weight(self, data, offset, device=None):
+    def load_weight(self, data, offset, device='cuda'):
         n_param = self.dim * self.dim
-        self.wq.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim)
+
+        self.wq.weight.data = data[offset : offset+n_param].view(self.dim, self.dim)
         offset += n_param
-        self.wk.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim)
+        self.wk.weight.data = data[offset : offset+n_param].view(self.dim, self.dim)
         offset += n_param
-        self.wv.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim)
+        self.wv.weight.data = data[offset : offset+n_param].view(self.dim, self.dim)
         offset += n_param
-        self.wo.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.dim)
-        # return offset + n_param
+        self.wo.weight.data = data[offset : offset+n_param].view(self.dim, self.dim)
     
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, multiple_of):
@@ -126,12 +123,11 @@ class FeedForward(nn.Module):
     
     def load_weight(self, data, offset, device=None):
         n_param = self.dim * self.hidden_dim
-        self.w1.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim)
+        self.w1.weight.data = data[offset : offset+n_param].view(self.hidden_dim, self.dim)
         offset += n_param
-        self.w2.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.dim, self.hidden_dim)
+        self.w2.weight.data = data[offset : offset+n_param].view(self.dim, self.hidden_dim)
         offset += n_param
-        self.w3.weight.data = torch.tensor(data[offset : offset+n_param], dtype=torch.float16, device=device).view(self.hidden_dim, self.dim)
-        # return offset + n_param
+        self.w3.weight.data = data[offset : offset+n_param].view(self.hidden_dim, self.dim)
     
 class TransformerBlock(nn.Module):
     def __init__(self, dim, multiple_of, n_heads, norm_eps, param, n_layers):
@@ -150,18 +146,12 @@ class TransformerBlock(nn.Module):
     def fetch(self, layer: int, device=None):
         data = np.memmap(os.path.join(self.serialized_dir, f'layer{layer}.bin'), dtype=np.float16, mode='r')
         offset = [0, 4*self.dim**2, 4*self.dim**2+3*self.dim*self.feed_forward.hidden_dim, 4*self.dim**2+3*self.dim*self.feed_forward.hidden_dim+self.dim]
-        # with Timing('attn + ffwd '):
-        #     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        #         executor.submit(self.attention.load_weight, data, offset[0], device)
-        #         executor.submit(self.feed_forward.load_weight, data, offset[1], device)
-        # with Timing('attention '):
-        self.attention.load_weight(data, offset[0], device)
-        # with Timing('ffwd '):
-        self.feed_forward.load_weight(data, offset[1], device)
-        # with Timing('att norm '):
-        self.attention_norm.load_weight(data, offset[2], device)
-        # with Timing('ffn norm '):
-        self.ffn_norm.load_weight(data, offset[3], device)
+        layer_weight = torch.tensor(data, dtype=torch.float16, device=device)
+
+        self.attention.load_weight(layer_weight, offset[0])
+        self.feed_forward.load_weight(layer_weight, offset[1])
+        self.attention_norm.load_weight(layer_weight, offset[2])
+        self.ffn_norm.load_weight(layer_weight, offset[3])
 
 class Transformer(nn.Module):
     def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=2048, param='7B'):
@@ -222,7 +212,6 @@ if __name__ == '__main__':
     model = Transformer(**args[PARAM]).half().to(device)
     model.load_state_dict(torch.load(f'serialized/{PARAM}/io.pt'))
 
-    # prompt = input('Enter prompt here: ')
     prompt = 'Elon Musk is '
     toks = [sp_model.bos_id()] + sp_model.encode(prompt)
     start_pos = 0
