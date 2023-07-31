@@ -146,8 +146,8 @@ class TransformerBlock(nn.Module):
     def fetch(self, layer: int, device=None):
         data = np.memmap(os.path.join(self.serialized_dir, f'layer{layer}.bin'), dtype=np.float16, mode='r')
         offset = [0, 4*self.dim**2, 4*self.dim**2+3*self.dim*self.feed_forward.hidden_dim, 4*self.dim**2+3*self.dim*self.feed_forward.hidden_dim+self.dim]
-        layer_weight = torch.tensor(data, dtype=torch.float16, device=device)
-
+        with Timing(f"layer {layer}: "):
+            layer_weight = torch.tensor(data, dtype=torch.float16, device=device)
         self.attention.load_weight(layer_weight, offset[0])
         self.feed_forward.load_weight(layer_weight, offset[1])
         self.attention_norm.load_weight(layer_weight, offset[2])
